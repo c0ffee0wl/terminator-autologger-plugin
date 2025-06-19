@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+
+"""
+context.py - Extract recent prompts, inputs and outputs from current terminal session
+Usage: context.py [number|all]
+       context.py -e | --environment
+       context.py -a | --all
+       context.py --original
+Example: context.py 5 (shows last 5 prompts/responses)
+         context.py all (shows entire history)
+         context.py -a (shows entire history)
+         context.py --original 3 (shows last 3 prompts from original log)
+         context.py -e (outputs export command for TERMINAL_LOG_FILE)
+Detects commands by prompt patterns rather than PROMPT_START markers
+"""
+
+import os
+import sys
+import re
+import tempfile
+import subprocess
+import argparse
+from pathlib import Path
+
+
+
+
+def find_log_file_for_terminal(use_original=False):
+    """Find the log file for the current terminal using PTY"""
+    # First try environment variable
+    env_log_file = os.environ.get('TERMINAL_LOG_FILE')
+    if env_log_file and os.path.exists(env_log_file):
+        if use_original:
+            # Convert to original version: terminal_X_ptsY.log -> terminal_X_ptsY_original.log
+            base_name = os.path.splitext(env_log_file)[0]
+            original_log_file = f"{base_name}_original.log"
+            if os.path.exists(original_log_file):
+                return original_log_file
+        else:
+            return env_log_file
+    
+    # Get current terminal's PTY and look for corresponding log file
+    try:
+        # Find our controlling terminal
+        tty = os.readlink('/proc/self/fd/0')  # Should be something like /dev/pts/1
+        if '/dev/pts/' in tty:
+            # Extract our PTY name (e.g., 'pts5' from '/dev/pts/5')
+            pts_num = tty.split('/dev/pts/')[-1]
+            current_pty_name = f"pts{pts_num}"
+            
+            # Look for log file in terminator logs directory  
+            log_dir = os.path.join(tempfile.gettempdir(), "terminator_logs")
+            if os.path.exists(log_dir):
+                # Look for files matching our PTY name
+                suffix = "_original.log" if use_original else ".log"
+                for filename in os.listdir(log_dir):
+                    if filename.startswith('terminal_') and filename.endswith(f'{current_pty_name}{suffix}'):
+                        logfile = os.path.join(log_dir, filename)
+                        if os.path.exists(logfile):
+                            return logfile
+                
+                # No fallback - if we can't find the right terminal, fail explicitly
+                return None
+    except:
+        pass
+    
+    return None
+
+
+
+def extract_prompts(log_file, count):
+    """Extract the last N commands and their output by detecting prompt patterns"""
+    if not os.path.exists(log_file):
+        return None
+    
+    try:
+        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+    except Exception:
+        return None
+    
+    if not content.strip():
+        return "No content found"
+    
+    # Split content by the reliable ┌── pattern to get command blocks
+    blocks = re.split(r'┌──[^\n]*\n', content)
+    sections = []
+    
+    for block in blocks:
+        if not block.strip():
+            continue
+            
+        lines = block.split('\n')
+        command_line = None
+        output_lines = []
+        
+        # Find the command line (looks for lines with # or $ at the end or with command patterns)
+        for i, line in enumerate(lines):
+            line_stripped = line.strip()
+            
+            # Skip empty lines and session markers
+            if not line_stripped or line_stripped.startswith('==='):
+                continue
+                
+            # Look for command pattern: anything ending with # followed by a command
+            # This handles both normal (└─# command) and sanitized (<PERSON_X>─# command) formats
+            if ('─#' in line_stripped and 
+                not line_stripped.endswith('─#') and  # Not just the prompt without command
+                len(line_stripped.split('─#')) == 2):  # Exactly one ─# separator
+                
+                command_part = line_stripped.split('─#')[-1].strip()
+                if command_part and not command_part.lower().startswith('context'):
+                    command_line = command_part
+                    # Collect remaining lines as output
+                    output_lines = [l.rstrip() for l in lines[i+1:] if l.strip()]
+                    break
+        
+        # Add to sections if we found a valid command
+        if command_line:
+            section = f"$ {command_line}"
+            if output_lines:
+                section += "\n" + "\n".join(output_lines)
+            sections.append(section)
+    
+    if not sections:
+        return "No commands found"
+    
+    # Return all sections if count is None, otherwise return last count sections
+    if count is None:
+        return '\n\n'.join(sections)
+    else:
+        start_idx = max(0, len(sections) - count)
+        return '\n\n'.join(sections[start_idx:])
+
+
+def main():
+    # Parse arguments
+    parser = argparse.ArgumentParser(description='Extract recent prompts from terminal session')
+    parser.add_argument('count', nargs='?', default=1, 
+                       help='Number of recent commands to show or "all" for entire history (default: 1)')
+    parser.add_argument('-e', '--environment', action='store_true',
+                       help='Output export command for TERMINAL_LOG_FILE variable')
+    parser.add_argument('-a', '--all', action='store_true',
+                       help='Show entire history')
+    parser.add_argument('--original', action='store_true',
+                       help='Use original log file (with _original suffix)')
+    
+    args = parser.parse_args()
+    
+    # Find log file
+    log_file = find_log_file_for_terminal(use_original=args.original)
+    if not log_file:
+        print("Error: No log file found", file=sys.stderr)
+        print("Make sure you're running this in a terminal with autologger enabled", file=sys.stderr)
+        sys.exit(1)
+    
+    # Handle environment flag
+    if args.environment:
+        print(f"export TERMINAL_LOG_FILE='{log_file}'")
+        return
+    
+    # Determine if we want all history
+    show_all = args.all or args.count == 'all'
+    
+    if show_all:
+        count = None  # Signal to show all
+    else:
+        # Validate count is a number
+        try:
+            count = int(args.count)
+            if count < 1:
+                raise ValueError()
+        except (ValueError, TypeError):
+            print("Error: Please provide a positive number or 'all'", file=sys.stderr)
+            parser.print_help(sys.stderr)
+            sys.exit(1)
+    
+    # Extract prompts
+    result = extract_prompts(log_file, count)
+    if result:
+        print(result)
+    else:
+        print("Error reading log file", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
