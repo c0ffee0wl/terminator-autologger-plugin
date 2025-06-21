@@ -81,7 +81,7 @@ def find_log_file_for_terminal(use_original=False):
                                 continue
                         else:
                             # Want sanitized files: must end with .log but NOT _original.log
-                            if not filename.endswith('.log') or filename.endswith('_original.log'):
+                            if filename.endswith('_original.log') or not filename.endswith('.log'):
                                 continue
                         
                         logfile = os.path.join(log_dir, filename)
@@ -89,8 +89,8 @@ def find_log_file_for_terminal(use_original=False):
                             matching_files.append((logfile, filename))
                 
                 if matching_files:
-                    # Sort by filename (which includes timestamp) in descending order to get newest first
-                    matching_files.sort(key=lambda x: x[1], reverse=True)
+                    # Sort by file modification time to get newest first
+                    matching_files.sort(key=lambda x: os.path.getmtime(x[0]), reverse=True)
                     return matching_files[0][0]  # Return the newest file
                 
                 # No fallback - if we can't find the right terminal, fail explicitly
