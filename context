@@ -31,13 +31,28 @@ def find_log_file_for_terminal(use_original=False):
     env_log_file = os.environ.get('TERMINAL_LOG_FILE')
     if env_log_file and os.path.exists(env_log_file):
         if use_original:
-            # Convert to original version: terminal_X_ptsY_timestamp.log -> terminal_X_ptsY_timestamp_original.log
-            base_name = os.path.splitext(env_log_file)[0]
-            original_log_file = f"{base_name}_original.log"
-            if os.path.exists(original_log_file):
-                return original_log_file
+            # Want original log
+            if env_log_file.endswith('_original.log'):
+                # Already pointing to original
+                return env_log_file
+            else:
+                # Convert sanitized to original
+                base_name = os.path.splitext(env_log_file)[0]
+                original_log_file = f"{base_name}_original.log"
+                if os.path.exists(original_log_file):
+                    return original_log_file
         else:
-            return env_log_file
+            # Want sanitized log
+            if env_log_file.endswith('_original.log'):
+                # Convert original to sanitized
+                sanitized_log_file = env_log_file.replace('_original.log', '.log')
+                if os.path.exists(sanitized_log_file):
+                    return sanitized_log_file
+                # If sanitized doesn't exist yet, return None to force directory scan
+                return None
+            else:
+                # Already pointing to sanitized
+                return env_log_file
     
     # Get current terminal's PTY and look for corresponding log file
     try:
@@ -52,14 +67,22 @@ def find_log_file_for_terminal(use_original=False):
             log_dir = os.path.join(tempfile.gettempdir(), "terminator_logs")
             if os.path.exists(log_dir):
                 # Look for files matching our PTY name and collect them with timestamps
-                suffix = "_original.log" if use_original else ".log"
                 matching_files = []
                 
                 for filename in os.listdir(log_dir):
                     # Only match new format: terminal_X_ptsY_YYYYMMDD_HHMMSS[_original].log
                     if (filename.startswith('terminal_') and 
-                        f'_pts{pts_num}_' in filename and 
-                        filename.endswith(suffix)):
+                        f'_pts{pts_num}_' in filename):
+                        
+                        # Be specific about suffix matching
+                        if use_original:
+                            # Want original files: must end with _original.log
+                            if not filename.endswith('_original.log'):
+                                continue
+                        else:
+                            # Want sanitized files: must end with .log but NOT _original.log
+                            if not filename.endswith('.log') or filename.endswith('_original.log'):
+                                continue
                         
                         logfile = os.path.join(log_dir, filename)
                         if os.path.exists(logfile):
@@ -158,17 +181,22 @@ def main():
     
     args = parser.parse_args()
     
-    # Find log file
+    # Handle environment flag - always export sanitized log path
+    if args.environment:
+        sanitized_log_file = find_log_file_for_terminal(use_original=False)
+        if not sanitized_log_file:
+            print("Error: No sanitized log file found", file=sys.stderr)
+            print("Make sure you're running this in a terminal with autologger enabled", file=sys.stderr)
+            sys.exit(1)
+        print(f"export TERMINAL_LOG_FILE='{sanitized_log_file}'")
+        return
+    
+    # Find log file for content extraction
     log_file = find_log_file_for_terminal(use_original=args.original)
     if not log_file:
         print("Error: No log file found", file=sys.stderr)
         print("Make sure you're running this in a terminal with autologger enabled", file=sys.stderr)
         sys.exit(1)
-    
-    # Handle environment flag
-    if args.environment:
-        print(f"export TERMINAL_LOG_FILE='{log_file}'")
-        return
     
     # Determine if we want all history
     show_all = args.all or args.count == 'all'
