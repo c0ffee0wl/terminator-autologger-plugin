@@ -31,7 +31,7 @@ def find_log_file_for_terminal(use_original=False):
     env_log_file = os.environ.get('TERMINAL_LOG_FILE')
     if env_log_file and os.path.exists(env_log_file):
         if use_original:
-            # Convert to original version: terminal_X_ptsY.log -> terminal_X_ptsY_original.log
+            # Convert to original version: terminal_X_ptsY_timestamp.log -> terminal_X_ptsY_timestamp_original.log
             base_name = os.path.splitext(env_log_file)[0]
             original_log_file = f"{base_name}_original.log"
             if os.path.exists(original_log_file):
@@ -51,13 +51,24 @@ def find_log_file_for_terminal(use_original=False):
             # Look for log file in terminator logs directory  
             log_dir = os.path.join(tempfile.gettempdir(), "terminator_logs")
             if os.path.exists(log_dir):
-                # Look for files matching our PTY name
+                # Look for files matching our PTY name and collect them with timestamps
                 suffix = "_original.log" if use_original else ".log"
+                matching_files = []
+                
                 for filename in os.listdir(log_dir):
-                    if filename.startswith('terminal_') and filename.endswith(f'{current_pty_name}{suffix}'):
+                    # Only match new format: terminal_X_ptsY_YYYYMMDD_HHMMSS[_original].log
+                    if (filename.startswith('terminal_') and 
+                        f'_pts{pts_num}_' in filename and 
+                        filename.endswith(suffix)):
+                        
                         logfile = os.path.join(log_dir, filename)
                         if os.path.exists(logfile):
-                            return logfile
+                            matching_files.append((logfile, filename))
+                
+                if matching_files:
+                    # Sort by filename (which includes timestamp) in descending order to get newest first
+                    matching_files.sort(key=lambda x: x[1], reverse=True)
+                    return matching_files[0][0]  # Return the newest file
                 
                 # No fallback - if we can't find the right terminal, fail explicitly
                 return None

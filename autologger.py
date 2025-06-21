@@ -18,12 +18,21 @@ class AutoLogger(plugin.Plugin):
     """ Automatically log terminal content with async I/O and unique terminal IDs """
     capabilities = ['terminal_menu']
     
+    # Class-level variables to track terminals across all plugin instances
+    _global_pty_to_terminal_id = {}
+    _global_session_timestamp = None
+    
     def __init__(self):
         plugin.Plugin.__init__(self)
         self.loggers = {}
         self.terminal_ids = {}
         self.terminal_counter = 0
         self.vte_version = Vte.get_minor_version()
+        
+        # Initialize global session timestamp if not set
+        if AutoLogger._global_session_timestamp is None:
+            AutoLogger._global_session_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
         
         # Auto-logging configuration
         self.log_directory = os.path.join(tempfile.gettempdir(), "terminator_logs")
@@ -143,34 +152,47 @@ class AutoLogger(plugin.Plugin):
         """ Generate or retrieve unique ID for terminal """
         vte_terminal = terminal.get_vte()
         
-        if vte_terminal not in self.terminal_ids:
-            try:
-                pty_fd = vte_terminal.get_pty().get_fd()
-                import ctypes
-                import ctypes.util
+        # First check if we already have an ID for this VTE object
+        if vte_terminal in self.terminal_ids:
+            return self.terminal_ids[vte_terminal]
+        
+        # Get PTY information to check for duplicates
+        try:
+            pty_fd = vte_terminal.get_pty().get_fd()
+            import ctypes
+            import ctypes.util
+            
+            libc = ctypes.CDLL(ctypes.util.find_library('c'))
+            ptsname = libc.ptsname
+            ptsname.restype = ctypes.c_char_p
+            ptsname.argtypes = [ctypes.c_int]
+            
+            pts_name = ptsname(pty_fd)
+            if pts_name:
+                pts_name = pts_name.decode('utf-8')
                 
-                libc = ctypes.CDLL(ctypes.util.find_library('c'))
-                ptsname = libc.ptsname
-                ptsname.restype = ctypes.c_char_p
-                ptsname.argtypes = [ctypes.c_int]
-                
-                pts_name = ptsname(pty_fd)
-                if pts_name:
-                    pts_name = pts_name.decode('utf-8')
+                # Check if we already have a terminal ID for this PTY path (globally)
+                if pts_name in AutoLogger._global_pty_to_terminal_id:
+                    terminal_id = AutoLogger._global_pty_to_terminal_id[pts_name]
+                else:
+                    # Create new terminal ID
                     if '/dev/pts/' in pts_name:
                         pts_num = pts_name.split('/dev/pts/')[-1]
-                        terminal_id = f"terminal_{pty_fd}_pts{pts_num}"
+                        terminal_id = f"terminal_{pty_fd}_pts{pts_num}_{AutoLogger._global_session_timestamp}"
                     else:
-                        terminal_id = f"terminal_{pty_fd}"
-                else:
-                    terminal_id = f"terminal_{pty_fd}"
+                        terminal_id = f"terminal_{pty_fd}_{AutoLogger._global_session_timestamp}"
+                    # Store the mapping globally
+                    AutoLogger._global_pty_to_terminal_id[pts_name] = terminal_id
+            else:
+                terminal_id = f"terminal_{pty_fd}_{AutoLogger._global_session_timestamp}"
                         
-            except Exception:
-                self.terminal_counter += 1
-                terminal_id = f"terminal_{self.terminal_counter}"
-            self.terminal_ids[vte_terminal] = terminal_id
+        except Exception:
+            self.terminal_counter += 1
+            terminal_id = f"terminal_{self.terminal_counter}_{AutoLogger._global_session_timestamp}"
         
-        return self.terminal_ids[vte_terminal]
+        # Cache the result for this VTE object
+        self.terminal_ids[vte_terminal] = terminal_id
+        return terminal_id
 
 
     def _check_for_new_terminals(self):
@@ -430,6 +452,7 @@ class AutoLogger(plugin.Plugin):
             terminal_id = self._get_terminal_id(terminal)
             original_logfile = f"{self.log_directory}/{terminal_id}_original.log"
             sanitized_logfile = f"{self.log_directory}/{terminal_id}.log"
+            
             
             cursor_pos = vte_terminal.get_cursor_position()
             initial_col, initial_row = cursor_pos if cursor_pos and len(cursor_pos) == 2 else (0, 0)
