@@ -21,6 +21,7 @@ class AutoLogger(plugin.Plugin):
     # Class-level variables to track terminals across all plugin instances
     _global_pty_to_terminal_id = {}
     _global_session_timestamp = None
+    _global_active_terminals = set()  # Track active terminals for cleanup
     
     def __init__(self):
         plugin.Plugin.__init__(self)
@@ -56,6 +57,8 @@ class AutoLogger(plugin.Plugin):
     def _async_writer(self):
         """ Background thread for async file writing """
         open_files = {}
+        file_last_used = {}
+        cleanup_counter = 0
         
         while not self._shutdown_writer:
             try:
@@ -81,6 +84,7 @@ class AutoLogger(plugin.Plugin):
                     fd = open_files[filepath]
                     fd.write(content)
                     fd.flush()
+                    file_last_used[filepath] = cleanup_counter
                     
                 except Exception:
                     if filepath in open_files:
@@ -89,10 +93,28 @@ class AutoLogger(plugin.Plugin):
                         except:
                             pass
                         del open_files[filepath]
+                        if filepath in file_last_used:
+                            del file_last_used[filepath]
                 
                 self.write_queue.task_done()
                 
             except queue.Empty:
+                # Periodically close unused files (every ~60 seconds of inactivity)
+                cleanup_counter += 1
+                if cleanup_counter % 60 == 0:
+                    files_to_close = []
+                    for filepath, last_used in file_last_used.items():
+                        if cleanup_counter - last_used > 60:  # 60 seconds of inactivity
+                            files_to_close.append(filepath)
+                    
+                    for filepath in files_to_close:
+                        if filepath in open_files:
+                            try:
+                                open_files[filepath].close()
+                            except:
+                                pass
+                            del open_files[filepath]
+                            del file_last_used[filepath]
                 continue
             except Exception:
                 pass
@@ -183,6 +205,7 @@ class AutoLogger(plugin.Plugin):
                         terminal_id = f"terminal_{pty_fd}_{AutoLogger._global_session_timestamp}"
                     # Store the mapping globally
                     AutoLogger._global_pty_to_terminal_id[pts_name] = terminal_id
+                    AutoLogger._global_active_terminals.add(pts_name)
             else:
                 terminal_id = f"terminal_{pty_fd}_{AutoLogger._global_session_timestamp}"
                         
@@ -194,15 +217,52 @@ class AutoLogger(plugin.Plugin):
         self.terminal_ids[vte_terminal] = terminal_id
         return terminal_id
 
+    def _cleanup_global_pty_dict(self):
+        """ Clean up orphaned PTY entries from global dictionary """
+        try:
+            # Check which PTY paths still exist
+            active_pts = set()
+            for pts_path in list(AutoLogger._global_active_terminals):
+                if os.path.exists(pts_path):
+                    active_pts.add(pts_path)
+                else:
+                    # PTY no longer exists, remove from global mappings
+                    if pts_path in AutoLogger._global_pty_to_terminal_id:
+                        del AutoLogger._global_pty_to_terminal_id[pts_path]
+            
+            # Update active terminals set
+            AutoLogger._global_active_terminals = active_pts
+        except Exception:
+            pass
 
     def _check_for_new_terminals(self):
-        """ Check for new terminals """
+        """ Check for new terminals and clean up destroyed ones """
         try:
             terminator = Terminator()
+            current_vte_terminals = set()
+            
+            # Start logging for new terminals
             for terminal in terminator.terminals:
                 vte_terminal = terminal.get_vte()
+                current_vte_terminals.add(vte_terminal)
                 if vte_terminal not in self.loggers:
                     self._start_logging(terminal)
+            
+            # Clean up destroyed terminals
+            destroyed_terminals = set(self.loggers.keys()) - current_vte_terminals
+            for vte_terminal in destroyed_terminals:
+                self._stop_logging(vte_terminal)
+            
+            # Periodically clean up global PTY dictionary (every ~30 seconds)
+            if hasattr(self, '_cleanup_counter'):
+                self._cleanup_counter += 1
+            else:
+                self._cleanup_counter = 0
+            
+            if self._cleanup_counter >= 60:  # 60 * 500ms = 30 seconds
+                self._cleanup_global_pty_dict()
+                self._cleanup_counter = 0
+                
         except:
             pass
         return True
@@ -523,26 +583,68 @@ class AutoLogger(plugin.Plugin):
             return
             
         try:
-            vte_terminal.disconnect(self.loggers[vte_terminal]["contents_handler"])
+            # Disconnect signal handler
+            handler_id = self.loggers[vte_terminal]["contents_handler"]
+            if handler_id and vte_terminal.handler_is_connected(handler_id):
+                vte_terminal.disconnect(handler_id)
+            
+            # Clean up dictionaries
             del self.loggers[vte_terminal]
             
             if vte_terminal in self.terminal_ids:
                 del self.terminal_ids[vte_terminal]
             
-        except:
-            pass
+        except Exception:
+            # Fallback cleanup in case of errors
+            try:
+                if vte_terminal in self.loggers:
+                    del self.loggers[vte_terminal]
+                if vte_terminal in self.terminal_ids:
+                    del self.terminal_ids[vte_terminal]
+            except:
+                pass
 
     def unload(self):
         """ Clean up when plugin unloads """
+        # Stop all terminal logging
         for vte_terminal in list(self.loggers.keys()):
             self._stop_logging(vte_terminal)
         
-        self._shutdown_writer = True
-        self.write_queue.put(None)
-        self.sanitize_queue.put(None)
+        # Clean up any remaining references
+        self.loggers.clear()
+        self.terminal_ids.clear()
         
+        # Shutdown background threads
+        self._shutdown_writer = True
+        
+        # Signal threads to stop
+        try:
+            self.write_queue.put(None, timeout=0.5)
+        except:
+            pass
+        try:
+            self.sanitize_queue.put(None, timeout=0.5)
+        except:
+            pass
+        
+        # Wait for threads to finish
         try:
             self.writer_thread.join(timeout=2.0)
             self.sanitizer_thread.join(timeout=2.0)
+        except:
+            pass
+        
+        # Clear queues
+        try:
+            while not self.write_queue.empty():
+                self.write_queue.get_nowait()
+                self.write_queue.task_done()
+        except:
+            pass
+        
+        try:
+            while not self.sanitize_queue.empty():
+                self.sanitize_queue.get_nowait()
+                self.sanitize_queue.task_done()
         except:
             pass
